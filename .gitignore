@@ -1,0 +1,36 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Local editor / MCP (machine-specific paths)
+.cursor/
+
+# Python (any subfolder)
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Testing / coverage
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated reports
+**/reports/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
