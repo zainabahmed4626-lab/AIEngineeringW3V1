@@ -1,4 +1,4 @@
-"""Supabase-backed MCP server for ADK agents (Model Context Protocol tools over stdio).
+"""Supabase-backed **read-only** MCP server for ADK agents (Model Context Protocol tools over stdio).
 
 This process exposes tools that query Postgres via ``supabase-py``. Run it as a **separate
 process** and point Google ADK / MCP clients at this server (stdio transport).
@@ -15,6 +15,10 @@ Environment (same as ``supabase_client``):
 
 Ensure Row Level Security policies allow the ``anon`` role to read the relevant tables
 (see ``sql/fix_rls_and_verify.sql``).
+
+Read-only policy:
+- This server must expose read-only tools only.
+- Tool implementations must not execute write operations (INSERT/UPDATE/DELETE/UPSERT).
 """
 
 from __future__ import annotations
@@ -49,14 +53,18 @@ except Exception:
 
 mcp = FastMCP("supabase-support-mcp")
 
+# Read-only MCP tool inventory exposed by this server.
+READ_ONLY_MCP_TOOLS = {"get_billing_info", "get_support_tickets"}
+
 
 @mcp.tool()
 def get_billing_info(email: str) -> str:
     """
-    Look up a customer by email and return a concise JSON summary of their orders
+    [READ-ONLY] Look up a customer by email and return a concise JSON summary of their orders
     (billing-related: ``order_number``, ``total_amount``, ``status``).
 
     Returns a JSON string for easy consumption by agents.
+    This tool is strictly read-only and does not mutate data.
     """
     email_clean = (email or "").strip()
     if not email_clean:
@@ -101,9 +109,10 @@ def get_billing_info(email: str) -> str:
 @mcp.tool()
 def get_support_tickets(email: str) -> str:
     """
-    Look up a customer by email and return all ``support_tickets`` for that customer.
+    [READ-ONLY] Look up a customer by email and return all ``support_tickets`` for that customer.
 
     Returns a JSON string containing ``customer`` metadata and a ``tickets`` list.
+    This tool is strictly read-only and does not mutate data.
     """
     email_clean = (email or "").strip()
     if not email_clean:

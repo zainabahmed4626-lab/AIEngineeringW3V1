@@ -30,6 +30,7 @@ import os
 import re
 from typing import Any
 
+import httpx
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 
 from .adk_runtime import run_llm_agent_once
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 _RETURNS_REMOTE_NAME = "returns_service_a2a"
 
 _APP_NAME = "returns_a2a_client"
+_ORDER_RE = re.compile(r"\bORD-\d{4}-\d+\b", re.IGNORECASE)
 
 
 def _default_agent_card_url(base_url: str) -> str:
@@ -78,6 +80,40 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     raise ValueError(f"no JSON object found in response: {raw[:300]}")
 
 
+def _looks_like_quota_error(text: str) -> bool:
+    s = (text or "").lower()
+    return any(
+        key in s
+        for key in (
+            "resource_exhausted",
+            "quota",
+            "429",
+            "rate limit",
+            "too many requests",
+        )
+    )
+
+
+def _extract_order_number(message: str) -> str | None:
+    m = _ORDER_RE.search(message or "")
+    return m.group(0).upper() if m else None
+
+
+def _wants_initiate_return(message: str) -> bool:
+    s = (message or "").lower()
+    return any(
+        k in s
+        for k in (
+            "initiate return",
+            "start return",
+            "create return",
+            "open return",
+            "return this",
+            "send it back",
+        )
+    )
+
+
 class ReturnsRemoteAgent:
     """
     Client for the returns microservice using ``RemoteA2aAgent``.
@@ -95,6 +131,53 @@ class ReturnsRemoteAgent:
             description="Remote returns A2A agent (eligibility + initiate return tools)",
         )
 
+    async def _http_tool_call(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+            return {"error": "invalid_response", "detail": "tool endpoint did not return JSON object"}
+
+    async def _fallback_handle(self, customer_id: str, message: str, reason: str) -> str:
+        order_number = _extract_order_number(message)
+        if not order_number:
+            return (
+                "I could not find an order number in your message. "
+                "Please include something like ORD-2026-0008 so I can check eligibility "
+                "or initiate the return."
+            )
+
+        try:
+            if _wants_initiate_return(message):
+                out = await self._http_tool_call(
+                    "/tools/initiate_return",
+                    {"order_number": order_number, "reason": message[:500]},
+                )
+                return (
+                    f"[Returns fallback] {out.get('message', 'Return initiated.')}\n"
+                    f"return_id={out.get('return_id', 'n/a')} status={out.get('status', 'n/a')}"
+                )
+
+            out = await self._http_tool_call(
+                "/tools/check_return_eligibility",
+                {"order_number": order_number},
+            )
+            eligible = bool(out.get("eligible", False))
+            decision = "eligible" if eligible else "not eligible"
+            return (
+                f"[Returns fallback] Order {order_number} is {decision} for return.\n"
+                f"Reason: {out.get('reason', 'No reason provided.')}"
+            )
+        except Exception as exc:
+            logger.warning("Returns fallback failed for customer %s: %s", customer_id, exc)
+            return (
+                "Returns service is temporarily degraded and the fallback check failed. "
+                "Please retry in a moment."
+            )
+
     async def check_return_eligibility(self, order_number: str) -> dict[str, Any]:
         """
         Ask the remote agent to run ``check_return_eligibility`` for ``order_number``.
@@ -108,15 +191,30 @@ class ReturnsRemoteAgent:
             'the tool result: {"eligible": <bool>, "reason": "<string>"}. '
             "No markdown, no explanation."
         )
-        text = await run_llm_agent_once(
-            agent=self._remote,
-            user_message=prompt,
-            app_name=_APP_NAME,
-        )
+        try:
+            text = await run_llm_agent_once(
+                agent=self._remote,
+                user_message=prompt,
+                app_name=_APP_NAME,
+            )
+        except Exception as exc:
+            if _looks_like_quota_error(str(exc)):
+                logger.warning("A2A quota hit; using HTTP fallback for check_return_eligibility")
+                return await self._http_tool_call(
+                    "/tools/check_return_eligibility",
+                    {"order_number": order_number},
+                )
+            raise
         try:
             data = _parse_json_object(text)
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning("Failed to parse eligibility JSON: %s — raw: %s", exc, text[:500])
+            if _looks_like_quota_error(text):
+                logger.warning("A2A quota text detected; using HTTP fallback for eligibility")
+                return await self._http_tool_call(
+                    "/tools/check_return_eligibility",
+                    {"order_number": order_number},
+                )
             return {"error": "parse_failed", "detail": str(exc), "raw": text[:2000]}
         return data
 
@@ -134,15 +232,30 @@ class ReturnsRemoteAgent:
             'the tool result: {"return_id": "<string>", "status": "initiated", "message": "<string>"}. '
             "No markdown, no explanation."
         )
-        text = await run_llm_agent_once(
-            agent=self._remote,
-            user_message=prompt,
-            app_name=_APP_NAME,
-        )
+        try:
+            text = await run_llm_agent_once(
+                agent=self._remote,
+                user_message=prompt,
+                app_name=_APP_NAME,
+            )
+        except Exception as exc:
+            if _looks_like_quota_error(str(exc)):
+                logger.warning("A2A quota hit; using HTTP fallback for initiate_return")
+                return await self._http_tool_call(
+                    "/tools/initiate_return",
+                    {"order_number": order_number, "reason": reason},
+                )
+            raise
         try:
             data = _parse_json_object(text)
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning("Failed to parse initiate_return JSON: %s — raw: %s", exc, text[:500])
+            if _looks_like_quota_error(text):
+                logger.warning("A2A quota text detected; using HTTP fallback for initiate_return")
+                return await self._http_tool_call(
+                    "/tools/initiate_return",
+                    {"order_number": order_number, "reason": reason},
+                )
             return {"error": "parse_failed", "detail": str(exc), "raw": text[:2000]}
         return data
 
@@ -159,8 +272,18 @@ class ReturnsRemoteAgent:
             "Use the returns tools as needed (check_return_eligibility, initiate_return) "
             "and answer helpfully."
         )
-        return await run_llm_agent_once(
-            agent=self._remote,
-            user_message=prompt,
-            app_name=_APP_NAME,
-        )
+        try:
+            text = await run_llm_agent_once(
+                agent=self._remote,
+                user_message=prompt,
+                app_name=_APP_NAME,
+            )
+            if _looks_like_quota_error(text):
+                logger.warning("A2A quota text detected; using returns HTTP fallback")
+                return await self._fallback_handle(customer_id, message, reason="quota_text")
+            return text
+        except Exception as exc:
+            if _looks_like_quota_error(str(exc)):
+                logger.warning("A2A quota exception detected; using returns HTTP fallback")
+                return await self._fallback_handle(customer_id, message, reason="quota_exception")
+            raise

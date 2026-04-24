@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 
 from .agents.billing_agent import BillingAgent
+from .agents.loop_agent import LoopAgent
 from .agents.returns_remote_agent import ReturnsRemoteAgent
 from .agents.router_agent import RouterAgent
 from .agents.support_agent import SupportAgent
@@ -50,6 +51,7 @@ RETURNS_SERVICE_URL = os.getenv("RETURNS_SERVICE_URL", "http://127.0.0.1:8081")
 billing_agent = BillingAgent()
 support_agent = SupportAgent()
 returns_remote_agent = ReturnsRemoteAgent(RETURNS_SERVICE_URL)
+loop_agent = LoopAgent()
 router_agent = RouterAgent(
     billing=billing_agent,
     support=support_agent,
@@ -60,6 +62,36 @@ supabase_mcp = SupabaseMCPServer()
 
 # Lazy MCP stdio client (Supabase MCP server subprocess connects when tools are first resolved).
 _supabase_mcp_toolset: McpToolset | None = None
+
+
+def _debug_mode_enabled() -> bool:
+    """Return True when debug logs should include LoopAgent review notes."""
+    return (os.getenv("DEBUG", "") or os.getenv("APP_DEBUG", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _finalize_with_loop(query: str, out: Any) -> str:
+    """
+    Refine specialist responses through LoopAgent before user display.
+
+    Routing remains unchanged: only specialist outputs are loop-processed. Escalation messages pass
+    through as-is so operational signaling remains explicit.
+    """
+    if out.routed_to not in {"billing", "support", "returns"}:
+        return out.answer
+
+    context = {
+        "routed_to": out.routed_to,
+        "metadata": {
+            "escalate": out.escalated,
+            "rationale": out.rationale,
+        },
+    }
+    reviewed = loop_agent.process(query=query, raw_answer=out.answer, context=context)
+
+    if _debug_mode_enabled():
+        print(f"[loop] review_notes={reviewed.get('review_notes', [])!r}")
+
+    return str(reviewed.get("final_answer", out.answer))
 
 
 def get_supabase_mcp_toolset() -> McpToolset:
@@ -103,8 +135,9 @@ async def support_query(payload: SupportQuery) -> dict[str, Any]:
     Route ``message`` for ``customer_id`` through :meth:`RouterAgent.route_with_meta`.
     """
     out = await router_agent.route_with_meta(payload.customer_id, payload.message)
+    final_answer = _finalize_with_loop(payload.message, out)
     return {
-        "result": out.answer,
+        "result": final_answer,
         "routed_to": out.routed_to,
         "escalated": out.escalated,
         "rationale": out.rationale,
@@ -147,7 +180,8 @@ async def _cli_loop_async() -> None:
             break
 
         out = await router_agent.route_with_meta(customer_id, line)
-        print(out.answer)
+        final_answer = _finalize_with_loop(line, out)
+        print(final_answer)
         print(f"[meta] routed_to={out.routed_to!r} escalated={out.escalated}")
         if out.rationale:
             print(f"[meta] rationale={out.rationale!r}")

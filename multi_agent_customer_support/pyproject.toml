@@ -15,6 +15,7 @@ dependencies = [
   "supabase",
   "python-dotenv",
   "httpx",
+  "gradio>=4.44,<6",
 ]
 
 [build-system]

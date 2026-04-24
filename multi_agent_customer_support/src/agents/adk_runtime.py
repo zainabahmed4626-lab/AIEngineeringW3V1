@@ -29,6 +29,27 @@ def genai_api_configured() -> bool:
     return bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
 
 
+def looks_like_genai_quota_error(exc: BaseException) -> bool:
+    """
+    True when ``exc`` is likely a Gemini / Google GenAI quota or rate-limit failure.
+
+    Used to fall back to deterministic tool paths so local UIs keep working when the
+    free tier is exhausted (HTTP 429 / RESOURCE_EXHAUSTED).
+    """
+    text = f"{type(exc).__name__} {exc!s}".lower()
+    return any(
+        m in text
+        for m in (
+            "resource_exhausted",
+            "429",
+            "quota",
+            "rate limit",
+            "too many requests",
+            "exhausted",
+        )
+    )
+
+
 async def run_llm_agent_once(
     *,
     agent: BaseAgent,
@@ -92,11 +113,17 @@ async def run_router_structured(
 
     Returns ``None`` if the model returns empty/unparseable output (caller should fall back).
     """
-    raw = await run_llm_agent_once(
-        agent=agent,
-        user_message=user_message,
-        app_name=app_name,
-    )
+    try:
+        raw = await run_llm_agent_once(
+            agent=agent,
+            user_message=user_message,
+            app_name=app_name,
+        )
+    except Exception as exc:
+        if looks_like_genai_quota_error(exc):
+            logger.warning("Router LLM quota/rate limit hit; caller should use heuristic fallback: %s", exc)
+            return None
+        raise
     if not raw:
         return None
     try:

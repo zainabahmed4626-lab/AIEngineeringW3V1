@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -64,6 +65,24 @@ from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.function_tool import FunctionTool
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+_WORKSPACE_ENV = Path(__file__).resolve().parents[3] / ".env"
+load_dotenv(_WORKSPACE_ENV)
+
+
+def _apply_returns_api_key_override() -> None:
+    """
+    Allow a dedicated key for the returns A2A service.
+
+    If ``RETURNS_GOOGLE_API_KEY`` is set, use it for the returns LLM agent without
+    affecting other services.
+    """
+    returns_key = (os.getenv("RETURNS_GOOGLE_API_KEY") or "").strip()
+    if returns_key:
+        os.environ["GOOGLE_API_KEY"] = returns_key
+        # Keep both names aligned for ADK/Gemini integrations.
+        os.environ.setdefault("GEMINI_API_KEY", returns_key)
 
 # ---------------------------------------------------------------------------
 # Mock tool implementations (also wrapped as ADK FunctionTools for the LlmAgent)
@@ -122,6 +141,7 @@ Reply in clear, short natural language and include key facts from the tool resul
 
 def build_returns_llm_agent() -> LlmAgent:
     """ADK agent exposed over A2A (tools: eligibility + initiate return)."""
+    _apply_returns_api_key_override()
     model = os.getenv("ADK_MODEL", "gemini-2.5-flash")
     return LlmAgent(
         name="returns_agent",

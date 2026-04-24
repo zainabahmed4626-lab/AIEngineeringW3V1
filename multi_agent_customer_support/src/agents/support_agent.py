@@ -11,13 +11,32 @@ from google.adk.tools.function_tool import FunctionTool
 
 from src.mcp.supabase_mcp_server import get_support_tickets
 
-from .adk_runtime import genai_api_configured, run_llm_agent_once
+from .adk_runtime import genai_api_configured, looks_like_genai_quota_error, run_llm_agent_once
 from .customer_context import resolve_customer_email
+from .tool_filter import ensure_tool_allowed
+
+ALLOWED_MCP_TOOLS = {"get_billing_info", "get_support_tickets"}
+
+
+def _call_allowed_tool(tool_name: str, email: str) -> str:
+    """
+    Guard and invoke a read-only MCP-parity tool by name.
+
+    SupportAgent currently uses only `get_support_tickets`, but keeps a shared allowlist shape.
+    """
+    ensure_tool_allowed(tool_name, ALLOWED_MCP_TOOLS)
+    if tool_name == "get_support_tickets":
+        return get_support_tickets(email)
+    raise ValueError(f"Unsupported tool mapping for {tool_name!r}")
+
+
+def _get_support_tickets_guarded(email: str) -> str:
+    return _call_allowed_tool("get_support_tickets", email)
 
 
 def _support_tools() -> list[Any]:
     return [
-        FunctionTool(get_support_tickets),
+        FunctionTool(_get_support_tickets_guarded),
     ]
 
 
@@ -55,7 +74,7 @@ class SupportAgent:
             )
 
         if not genai_api_configured():
-            tickets_json = get_support_tickets(email)
+            tickets_json = _call_allowed_tool("get_support_tickets", email)
             return _format_support_fallback(tickets_json, message)
 
         user_prompt = (
@@ -63,11 +82,22 @@ class SupportAgent:
             f"Customer id (reference): {customer_id}\n\n"
             f"User message:\n{message}\n"
         )
-        return await run_llm_agent_once(
-            agent=self._agent,
-            user_message=user_prompt,
-            app_name="support",
-        )
+        try:
+            return await run_llm_agent_once(
+                agent=self._agent,
+                user_message=user_prompt,
+                app_name="support",
+            )
+        except Exception as exc:
+            if looks_like_genai_quota_error(exc):
+                tickets_json = _call_allowed_tool("get_support_tickets", email)
+                base = _format_support_fallback(tickets_json, message)
+                return (
+                    f"{base}\n\n"
+                    "[Note] Gemini quota or rate limit was hit; this summary was built "
+                    "directly from support tickets without the LLM."
+                )
+            raise
 
 
 def _format_support_fallback(tickets_json: str, message: str) -> str:
